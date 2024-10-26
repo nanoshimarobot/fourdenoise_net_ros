@@ -1,0 +1,3 @@
+[submodule "FourDenoiseNet"]
+	path = fourdenoise_net_ros/FourDenoiseNet
+	url = https://github.com/nanoshimarobot/4DenoiseNet.git
