@@ -25,6 +25,7 @@ from tqdm.contrib import tenumerate
 import ros2_numpy
 from cv_bridge import CvBridge
 
+
 class fourdenoise_net_ros(Node):
     def __init__(self):
         super().__init__("fourdenoise_net_ros")
@@ -68,7 +69,7 @@ class fourdenoise_net_ros(Node):
         scan_x = cloud_np["x"]
         scan_y = cloud_np["y"]
         scan_z = cloud_np["z"]
-        scan_intensity = cloud_np["remission"]
+        intensity = cloud_np["remission"]
 
         cloud_size = cloud_np.shape[0]
 
@@ -138,30 +139,14 @@ class fourdenoise_net_ros(Node):
             torch_unproj_xyz,
         )
 
-        # print(proj_x.shape)
-        # print(proj_x)
-        # print(proj_y)
-        # depth_img = np.zeros((64, 2048), dtype=np.float32)
-        # # depth_img[proj_y, proj_x] = depth
-        # depth_img[proj_y, proj_x] = scan_intensity
-
-        # img = self.__cv_bridge.cv2_to_imgmsg(depth_img, encoding="32FC1")
-        # self.__output_img_pub.publish(img)
-
     def cloud_cb(self, msg: PointCloud2) -> None:
-        self.get_logger().info("cloud cb")
         if self.pre_cloud is None:
             self.pre_cloud = msg
             return
 
-        (
-            pre_proj_x,
-            pre_proj_y,
-            pre_proj_range,
-            pre_proj_xyz,
-            pre_proj_remission,
-            pre_unproj_xyz,
-        ) = self.preprocess(self.pre_cloud)
+        _, _, pre_proj_range, pre_proj_xyz, pre_proj_remission, _ = self.preprocess(
+            self.pre_cloud
+        )
         proj_x, proj_y, proj_range, proj_xyz, proj_remission, unproj_xyz = (
             self.preprocess(msg)
         )
@@ -183,9 +168,13 @@ class fourdenoise_net_ros(Node):
                 proj_remission.unsqueeze(0).clone(),
             ]
         )
-        
-        pre_proj_in = (pre_proj_in - self.sensor_img_means[:, None, None]) / self.sensor_img_stds[:, None, None]
-        proj_in = (proj_in - self.sensor_img_means[:, None, None]) / self.sensor_img_stds[:, None, None]
+
+        pre_proj_in = (
+            pre_proj_in - self.sensor_img_means[:, None, None]
+        ) / self.sensor_img_stds[:, None, None]
+        proj_in = (
+            proj_in - self.sensor_img_means[:, None, None]
+        ) / self.sensor_img_stds[:, None, None]
 
         pre_proj_full = torch.cat([pre_proj_full, pre_proj_in])
         proj_full = torch.cat([proj_full, proj_in])
@@ -202,23 +191,43 @@ class fourdenoise_net_ros(Node):
             unproj_argmax = proj_argmax[proj_y, proj_x]
             unproj_argmax[torch.all(unproj_xyz == -1, axis=1)] = 1
 
+            # print(unproj_argmax)
             mask: torch.Tensor = unproj_argmax == 1
+            mask_clutter: torch.Tensor = unproj_argmax != 1
             filtered_xyz: torch.Tensor = unproj_xyz[mask.cpu()]
+            clutter_xyz: torch.Tensor = unproj_xyz[mask_clutter.cpu()]
 
+            normal_color = torch.Tensor([0.0, 1.0, 0.0])
+            clutter_color = torch.Tensor([1.0, 0.0, 0.0])
+            normal_color = torch.tile(normal_color, (filtered_xyz.shape[0], 1))
+            clutter_color = torch.tile(clutter_color, (clutter_xyz.shape[0], 1))
+
+            filtered_xyz = torch.cat([filtered_xyz, normal_color], dim=1)
+            clutter_xyz = torch.cat([clutter_xyz, clutter_color], dim=1)
+
+            segmented_xyz = torch.cat([filtered_xyz, clutter_xyz], dim=0)
             fields = [
                 PointField(name="x", offset=0, datatype=7, count=1),
                 PointField(name="y", offset=4, datatype=7, count=1),
                 PointField(name="z", offset=8, datatype=7, count=1),
+                # PointField(name="entity_id", offset=12, datatype=2, count=1)
+                PointField(name="r", offset=12, datatype=7, count=1),
+                PointField(name="g", offset=16, datatype=7, count=1),
+                PointField(name="b", offset=20, datatype=7, count=1),
             ]
 
             header = Header()
             header.frame_id = msg.header.frame_id
             header.stamp = self.get_clock().now().to_msg()
             output_filtered_cloud = create_cloud(
-                header, fields, filtered_xyz.numpy().tolist()
+                # header, fields, filtered_xyz.numpy().tolist()
+                header,
+                fields,
+                segmented_xyz.numpy().tolist(),
             )
             self.__output_filtered_cloud_pub.publish(output_filtered_cloud)
         self.pre_cloud = msg
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
