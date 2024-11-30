@@ -119,6 +119,23 @@ class fourdenoise_net_ros(Node):
         proj_xyz[proj_y, proj_x] = points
         proj_remission[proj_y, proj_x] = remissions
 
+        # print("============")
+        # print(proj_remission)
+        # print("============")
+        range_mean = np.mean(depth)
+        range_stds = np.std(depth)
+        point_means = np.mean(points, axis=0)
+        point_stds = np.std(points, axis=0)
+        remission_means = np.mean(remissions)
+        remissions_stds = np.std(remissions)
+
+        means = torch.Tensor(
+            [range_mean, point_means[2], point_means[0], point_means[1], remission_means]
+        )
+        stds = torch.Tensor(
+            [range_stds, point_stds[2], point_stds[0], point_stds[1], remissions_stds]
+        )
+
         # torch
         torch_proj_x = torch.full([cloud_size], -1, dtype=torch.long)
         torch_proj_y = torch.full([cloud_size], -1, dtype=torch.long)
@@ -128,14 +145,25 @@ class fourdenoise_net_ros(Node):
         torch_proj_xyz = torch.from_numpy(proj_xyz)
         torch_proj_remission = torch.from_numpy(proj_remission)
 
+        torch_proj_in = torch.cat(
+            [
+                torch_proj_range.unsqueeze(0),
+                torch_proj_xyz.permute(2, 0, 1),
+                torch_proj_remission.unsqueeze(0),
+            ]
+        )
+        torch_proj_full = torch.Tensor()
+        torch_proj_in = (torch_proj_in - self.sensor_img_means[:, None, None]) / self.sensor_img_stds[:, None, None]
+        torch_proj_full = torch.cat([torch_proj_full, torch_proj_in])
         torch_unproj_xyz = torch.from_numpy(points)
 
         return (
             torch_proj_x,
             torch_proj_y,
-            torch_proj_range,
-            torch_proj_xyz,
-            torch_proj_remission,
+            # torch_proj_range,
+            # torch_proj_xyz,
+            # torch_proj_remission,
+            torch_proj_in,
             torch_unproj_xyz,
         )
 
@@ -143,41 +171,9 @@ class fourdenoise_net_ros(Node):
         if self.pre_cloud is None:
             self.pre_cloud = msg
             return
-
-        _, _, pre_proj_range, pre_proj_xyz, pre_proj_remission, _ = self.preprocess(
-            self.pre_cloud
-        )
-        proj_x, proj_y, proj_range, proj_xyz, proj_remission, unproj_xyz = (
-            self.preprocess(msg)
-        )
-
-        pre_proj_full = torch.Tensor()
-        proj_full = torch.Tensor()
-
-        pre_proj_in = torch.cat(
-            [
-                pre_proj_range.unsqueeze(0).clone(),
-                pre_proj_xyz.clone().permute(2, 0, 1),
-                pre_proj_remission.unsqueeze(0).clone(),
-            ]
-        )
-        proj_in = torch.cat(
-            [
-                proj_range.unsqueeze(0).clone(),
-                proj_xyz.clone().permute(2, 0, 1),
-                proj_remission.unsqueeze(0).clone(),
-            ]
-        )
-
-        pre_proj_in = (
-            pre_proj_in - self.sensor_img_means[:, None, None]
-        ) / self.sensor_img_stds[:, None, None]
-        proj_in = (
-            proj_in - self.sensor_img_means[:, None, None]
-        ) / self.sensor_img_stds[:, None, None]
-
-        pre_proj_full = torch.cat([pre_proj_full, pre_proj_in])
-        proj_full = torch.cat([proj_full, proj_in])
+        
+        _, _, pre_proj_full, _ = self.preprocess(self.pre_cloud)
+        proj_x, proj_y, proj_full, unproj_xyz = self.preprocess(msg)
 
         proj_full = proj_full.cuda()
         pre_proj_full = pre_proj_full.cuda()
