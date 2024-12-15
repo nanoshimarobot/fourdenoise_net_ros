@@ -2,6 +2,8 @@ import torch
 from torch.utils.data.dataloader import DataLoader
 import torch.multiprocessing
 
+import rclpy.duration
+
 torch.multiprocessing.set_sharing_strategy("file_system")
 import yaml
 import os
@@ -16,7 +18,12 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from rclpy.qos import (
+    QoSProfile,
+    QoSReliabilityPolicy,
+    QoSHistoryPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import PointCloud2, PointField, Image
 from sensor_msgs_py.point_cloud2 import create_cloud_xyz32, create_cloud
 from std_msgs.msg import Header
@@ -24,6 +31,9 @@ from tqdm.contrib import tenumerate
 
 import ros2_numpy
 from cv_bridge import CvBridge
+
+import tf2_ros
+import tf2_geometry_msgs
 
 
 class fourdenoise_net_ros(Node):
@@ -53,31 +63,89 @@ class fourdenoise_net_ros(Node):
         self.model.eval()
         self.pre_cloud = None
 
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
         # self.__output_cloud_pub = self.create_publisher(PointCloud2, "output", 10)
         self.__output_filtered_cloud_pub = self.create_publisher(
             PointCloud2, "output_filtered", 10
         )
         self.__output_img_pub = self.create_publisher(Image, "output/depth", 10)
         self.__cloud_sub = self.create_subscription(
-            PointCloud2, "/kitti/output_cloud", self.cloud_cb, 10
+            PointCloud2,
+            "/sensing/lidar/concatenated/pointcloud",
+            # "/kitti/output_cloud",
+            self.cloud_cb,
+            # self.test_cloud_cb,
+            qos_profile_sensor_data,
+            # 10,
         )
 
-    def preprocess(
-        self, msg: PointCloud2
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self.get_logger().info("Initialized fourdenoise_net_ros")
+
+    def fov_filter(self, msg: PointCloud2) -> np.ndarray:
+        try:
+            base_to_lidar = self.tf_buffer.lookup_transform("base_link", "velodyne_top", rclpy.time.Time())
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().error("Failed to lookup transform: %s" % str(e))
+            return
+
+        base_to_lidar_offset = np.array([
+            base_to_lidar.transform.translation.x,
+            base_to_lidar.transform.translation.y,
+            base_to_lidar.transform.translation.z
+        ])
+
         cloud_np: np.ndarray = ros2_numpy.numpify(msg)
         scan_x = cloud_np["x"]
         scan_y = cloud_np["y"]
         scan_z = cloud_np["z"]
-        intensity = cloud_np["remission"]
 
-        cloud_size = cloud_np.shape[0]
+        # print(f"scan_x: {scan_x.shape}")
+        # intensity = cloud_np["intensity"]
 
-        # print(cloud_np.reshape(-1, 1)[0].dtype)
-        # print(scan_x)
         points = np.concatenate(
             [scan_x.reshape(-1, 1), scan_y.reshape(-1, 1), scan_z.reshape(-1, 1)], 1
         )
+
+        offset_points = points - base_to_lidar_offset
+        # filter out points that has large or small fov
+        fov_up = 3.0 / 180.0
+        fov_down = -25.0 / 180.0
+        fov = abs(fov_up) + abs(fov_down)
+        depth = np.linalg.norm(offset_points, 2, 1)
+
+        vertical_angle = np.arcsin((scan_z - base_to_lidar_offset[2]) / depth)
+        # vertical_angle = np.arcsin((scan_z) / depth)
+
+        fov_mask = (vertical_angle >= fov_down) & (vertical_angle <= fov_up)
+        filtered_points = points[fov_mask]
+        filtered_scan_x = filtered_points[:, 0]
+        filtered_scan_y = filtered_points[:, 1]
+        filtered_scan_z = filtered_points[:, 2]
+
+        # print(f"filtered_scan_x: {filtered_scan_x.shape}")
+
+        return filtered_points, filtered_scan_x, filtered_scan_y, filtered_scan_z
+
+    def preprocess(
+        self, msg: PointCloud2
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # cloud_np: np.ndarray = ros2_numpy.numpify(msg)
+        # scan_x = cloud_np["x"]
+        # scan_y = cloud_np["y"]
+        # scan_z = cloud_np["z"]
+        # intensity = cloud_np["intensity"]
+
+        points, scan_x, scan_y, scan_z = self.fov_filter(msg)
+
+        cloud_size = points.shape[0]
+
+        # print(cloud_np.reshape(-1, 1)[0].dtype)
+        # print(scan_x)
+        # points = np.concatenate(
+        #     [scan_x.reshape(-1, 1), scan_y.reshape(-1, 1), scan_z.reshape(-1, 1)], 1
+        # )
         # print(points)
 
         # pointcloud projection
@@ -122,19 +190,25 @@ class fourdenoise_net_ros(Node):
         # print("============")
         # print(proj_remission)
         # print("============")
-        range_mean = np.mean(depth)
-        range_stds = np.std(depth)
-        point_means = np.mean(points, axis=0)
-        point_stds = np.std(points, axis=0)
-        remission_means = np.mean(remissions)
-        remissions_stds = np.std(remissions)
+        # range_mean = np.mean(depth)
+        # range_stds = np.std(depth)
+        # point_means = np.mean(points, axis=0)
+        # point_stds = np.std(points, axis=0)
+        # remission_means = np.mean(remissions)
+        # remissions_stds = np.std(remissions)
 
-        means = torch.Tensor(
-            [range_mean, point_means[2], point_means[0], point_means[1], remission_means]
-        )
-        stds = torch.Tensor(
-            [range_stds, point_stds[2], point_stds[0], point_stds[1], remissions_stds]
-        )
+        # means = torch.Tensor(
+        #     [
+        #         range_mean,
+        #         point_means[2],
+        #         point_means[0],
+        #         point_means[1],
+        #         remission_means,
+        #     ]
+        # )
+        # stds = torch.Tensor(
+        #     [range_stds, point_stds[2], point_stds[0], point_stds[1], remissions_stds]
+        # )
 
         # torch
         torch_proj_x = torch.full([cloud_size], -1, dtype=torch.long)
@@ -153,7 +227,9 @@ class fourdenoise_net_ros(Node):
             ]
         )
         torch_proj_full = torch.Tensor()
-        torch_proj_in = (torch_proj_in - self.sensor_img_means[:, None, None]) / self.sensor_img_stds[:, None, None]
+        torch_proj_in = (
+            torch_proj_in - self.sensor_img_means[:, None, None]
+        ) / self.sensor_img_stds[:, None, None]
         torch_proj_full = torch.cat([torch_proj_full, torch_proj_in])
         torch_unproj_xyz = torch.from_numpy(points)
 
@@ -167,11 +243,55 @@ class fourdenoise_net_ros(Node):
             torch_unproj_xyz,
         )
 
+    def test_cloud_cb(self, msg: PointCloud2) -> None:
+        # try:
+        #     base_to_lidar = self.tf_buffer.lookup_transform("base_link", "velodyne_top", rclpy.time.Time())
+        # except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+        #     self.get_logger().error("Failed to lookup transform: %s" % str(e))
+        #     return
+
+        # base_to_lidar_offset = np.array([
+        #     base_to_lidar.transform.translation.x,
+        #     base_to_lidar.transform.translation.y,
+        #     base_to_lidar.transform.translation.z
+        # ])
+
+        cloud_np: np.ndarray = ros2_numpy.numpify(msg)
+        scan_x = cloud_np["x"]
+        scan_y = cloud_np["y"]
+        scan_z = cloud_np["z"]
+        intensity = cloud_np["intensity"]
+
+        points = np.concatenate(
+            [scan_x.reshape(-1, 1), scan_y.reshape(-1, 1), scan_z.reshape(-1, 1)], 1
+        )
+
+        offset_points = points  # - base_to_lidar_offset
+        # filter out points that has large or small fov
+        fov_up = 3.0 / 180.0
+        fov_down = -25.0 / 180.0
+        fov = abs(fov_up) + abs(fov_down)
+        depth = np.linalg.norm(offset_points, 2, 1)
+
+        # vertical_angle = np.arcsin((scan_z - base_to_lidar_offset[2]) / depth)
+        vertical_angle = np.arcsin((scan_z) / depth)
+        fov_mask = (vertical_angle >= fov_down) & (vertical_angle <= fov_up)
+        points = points[fov_mask]
+
+        # scan_x = points[:, 0]
+        # scan_y = points[:, 1]
+        # scan_z = points
+
+        output_msg = create_cloud_xyz32(Header(frame_id=msg.header.frame_id), points)
+        self.__output_filtered_cloud_pub.publish(output_msg)
+        self.get_logger().info("Published filtered cloud")
+
     def cloud_cb(self, msg: PointCloud2) -> None:
+        # self.get_logger().info("Received cloud")
         if self.pre_cloud is None:
             self.pre_cloud = msg
             return
-        
+
         _, _, pre_proj_full, _ = self.preprocess(self.pre_cloud)
         proj_x, proj_y, proj_full, unproj_xyz = self.preprocess(msg)
 
