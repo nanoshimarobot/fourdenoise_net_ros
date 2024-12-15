@@ -63,6 +63,8 @@ class fourdenoise_net_ros(Node):
         self.model.eval()
         self.pre_cloud = None
 
+        self.need_offset_calc = True
+
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
@@ -75,6 +77,7 @@ class fourdenoise_net_ros(Node):
             PointCloud2,
             "/sensing/lidar/concatenated/pointcloud",
             # "/kitti/output_cloud",
+            # "output_filtered",
             self.cloud_cb,
             # self.test_cloud_cb,
             qos_profile_sensor_data,
@@ -85,21 +88,30 @@ class fourdenoise_net_ros(Node):
 
     def fov_filter(self, msg: PointCloud2) -> np.ndarray:
         try:
-            base_to_lidar = self.tf_buffer.lookup_transform("base_link", "velodyne_top", rclpy.time.Time())
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            base_to_lidar = self.tf_buffer.lookup_transform(
+                "base_link", "velodyne_top", rclpy.time.Time()
+            )
+        except (
+            tf2_ros.LookupException,
+            tf2_ros.ConnectivityException,
+            tf2_ros.ExtrapolationException,
+        ) as e:
             self.get_logger().error("Failed to lookup transform: %s" % str(e))
             return
 
-        base_to_lidar_offset = np.array([
-            base_to_lidar.transform.translation.x,
-            base_to_lidar.transform.translation.y,
-            base_to_lidar.transform.translation.z
-        ])
+        base_to_lidar_offset = np.array(
+            [
+                base_to_lidar.transform.translation.x,
+                base_to_lidar.transform.translation.y,
+                base_to_lidar.transform.translation.z,
+            ]
+        )
 
         cloud_np: np.ndarray = ros2_numpy.numpify(msg)
         scan_x = cloud_np["x"]
         scan_y = cloud_np["y"]
         scan_z = cloud_np["z"]
+        # remissions = cloud_np["remission"]
 
         # print(f"scan_x: {scan_x.shape}")
         # intensity = cloud_np["intensity"]
@@ -107,6 +119,8 @@ class fourdenoise_net_ros(Node):
         points = np.concatenate(
             [scan_x.reshape(-1, 1), scan_y.reshape(-1, 1), scan_z.reshape(-1, 1)], 1
         )
+
+        # return points, scan_x, scan_y, scan_z, remissions
 
         offset_points = points - base_to_lidar_offset
         # filter out points that has large or small fov
@@ -119,25 +133,59 @@ class fourdenoise_net_ros(Node):
         # vertical_angle = np.arcsin((scan_z) / depth)
 
         fov_mask = (vertical_angle >= fov_down) & (vertical_angle <= fov_up)
-        filtered_points = points[fov_mask]
+        filtered_points = offset_points[fov_mask]
         filtered_scan_x = filtered_points[:, 0]
         filtered_scan_y = filtered_points[:, 1]
         filtered_scan_z = filtered_points[:, 2]
 
+        remissions = np.zeros((filtered_scan_x.shape[0]), dtype=np.float32)
         # print(f"filtered_scan_x: {filtered_scan_x.shape}")
 
-        return filtered_points, filtered_scan_x, filtered_scan_y, filtered_scan_z
+        return (
+            filtered_points,
+            filtered_scan_x,
+            filtered_scan_y,
+            filtered_scan_z,
+            remissions,
+        )
 
     def preprocess(
         self, msg: PointCloud2
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # cloud_np: np.ndarray = ros2_numpy.numpify(msg)
-        # scan_x = cloud_np["x"]
-        # scan_y = cloud_np["y"]
-        # scan_z = cloud_np["z"]
-        # intensity = cloud_np["intensity"]
+        cloud_np: np.ndarray = ros2_numpy.numpify(msg)
+        scan_x = cloud_np["x"]
+        scan_y = cloud_np["y"]
+        scan_z = cloud_np["z"]
+        points = np.concatenate(
+            [scan_x.reshape(-1, 1), scan_y.reshape(-1, 1), scan_z.reshape(-1, 1)], 1
+        )
 
-        points, scan_x, scan_y, scan_z = self.fov_filter(msg)
+        if self.need_offset_calc:
+            try:
+                base_to_lidar = self.tf_buffer.lookup_transform(
+                    "base_link", "velodyne_top", rclpy.time.Time()
+                )
+            except (
+                tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException,
+            ) as e:
+                self.get_logger().error("Failed to lookup transform: %s" % str(e))
+                return
+            base_to_lidar_offset = np.array(
+                [
+                    base_to_lidar.transform.translation.x,
+                    base_to_lidar.transform.translation.y,
+                    base_to_lidar.transform.translation.z,
+                ]
+            )
+
+            points = points - base_to_lidar_offset
+            scan_x = points[:, 0]
+            scan_y = points[:, 1]
+            scan_z = points[:, 2]
+
+        remissions = np.zeros((scan_x.shape[0]), dtype=np.float32)
 
         cloud_size = points.shape[0]
 
@@ -177,7 +225,7 @@ class fourdenoise_net_ros(Node):
         proj_x = proj_x[order]
         proj_y = proj_y[order]
 
-        remissions = np.zeros((cloud_size), dtype=np.float32)
+        # remissions = np.zeros((cloud_size), dtype=np.float32)
 
         proj_range = np.full((64, 2048), -1, dtype=np.float32)
         proj_xyz = np.full((64, 2048, 3), -1, dtype=np.float32)
@@ -340,6 +388,7 @@ class fourdenoise_net_ros(Node):
                 header,
                 fields,
                 segmented_xyz.numpy().tolist(),
+                # filtered_xyz.cpu().numpy().tolist(),
             )
             self.__output_filtered_cloud_pub.publish(output_filtered_cloud)
         self.pre_cloud = msg
